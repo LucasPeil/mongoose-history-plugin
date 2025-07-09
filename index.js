@@ -4,8 +4,8 @@ let JsonDiffPatch = require('jsondiffpatch'),
 let historyPlugin = (options = {}) => {
   let pluginOptions = {
     mongoose: false, // A mongoose instance
-    connection: undefined, // DB connection to use instead of default connection
     modelName: '__histories', // Name of the collection for the histories
+    useMonthlyPartition: true,
     embeddedDocument: false, // Is this a sub document
     embeddedModelName: '', // Name of model if used with embedded document
     userCollection: 'users', // Collection to ref when you pass an user id
@@ -27,7 +27,7 @@ let historyPlugin = (options = {}) => {
     // If false save the whole object of the populated fields
     // If false and a populated field property changes it triggers a new history
     // You need to populate the field after a change is made on the original document or it will not catch the differences
-    ignorePopulatedFields: true
+    ignorePopulatedFields: true,
   };
 
   Object.assign(pluginOptions, options);
@@ -38,9 +38,12 @@ let historyPlugin = (options = {}) => {
 
   let mongoose = pluginOptions.mongoose;
 
-  const collectionIdType = options.collectionIdType || mongoose.Schema.Types.ObjectId;
-  const userCollectionIdType = options.userCollectionIdType || mongoose.Schema.Types.ObjectId;
-  const accountCollectionIdType = options.accountCollectionIdType || mongoose.Schema.Types.ObjectId;
+  const collectionIdType =
+    options.collectionIdType || mongoose.Schema.Types.ObjectId;
+  const userCollectionIdType =
+    options.userCollectionIdType || mongoose.Schema.Types.ObjectId;
+  const accountCollectionIdType =
+    options.accountCollectionIdType || mongoose.Schema.Types.ObjectId;
 
   let Schema = new mongoose.Schema(
     {
@@ -52,18 +55,18 @@ let historyPlugin = (options = {}) => {
       data: { type: mongoose.Schema.Types.Mixed },
       [pluginOptions.userFieldName]: {
         type: userCollectionIdType,
-        ref: pluginOptions.userCollection
+        ref: pluginOptions.userCollection,
       },
       [pluginOptions.accountFieldName]: {
         type: accountCollectionIdType,
-        ref: pluginOptions.accountCollection
+        ref: pluginOptions.accountCollection,
       },
       version: { type: String, default: pluginOptions.startingVersion },
       [pluginOptions.timestampFieldName]: Date,
-      [pluginOptions.methodFieldName]: String
+      [pluginOptions.methodFieldName]: String,
     },
     {
-      collection: pluginOptions.modelName
+      collection: pluginOptions.modelName,
     }
   );
 
@@ -75,14 +78,14 @@ let historyPlugin = (options = {}) => {
     this[pluginOptions.timestampFieldName] = new Date();
     next();
   });
-
-  const connection = pluginOptions.connection || mongoose.connection;
-  let Model = connection.model(pluginOptions.modelName, Schema);
+  /* 
+  let Model = mongoose.model(pluginOptions.modelName, Schema);
 
   let getModelName = (defaultName) => {
     return pluginOptions.embeddedDocument ? pluginOptions.embeddedModelName : defaultName;
-  };
-
+  }; */
+  const getModelName = (doc) =>
+    pluginOptions.embeddedDocument ? pluginOptions.embeddedModelName : doc;
   let jdf = JsonDiffPatch.create({
     objectHash: function (obj, index) {
       if (obj !== undefined) {
@@ -97,36 +100,100 @@ let historyPlugin = (options = {}) => {
       return '$$index:' + index;
     },
     arrays: {
-      detectMove: true
-    }
+      detectMove: true,
+    },
   });
+  const getPartitionedModel = (yearMonthSuffix) => {
+    if (!pluginOptions.useMonthlyPartition)
+      return mongoose.model(pluginOptions.modelName);
+    const collectionName = pluginOptions.modelName + yearMonthSuffix;
+    return (
+      mongoose.models[collectionName] ||
+      mongoose.model(collectionName, Schema, collectionName)
+    );
+  };
 
-  let query = (method = 'find', options = {}) => {
-    let query = Model[method](options.find || {});
+  const formatDate = (isoDate) => {
+    const day = String(isoDate.getDate()).padStart(2, '0');
+    const month = String(isoDate.getMonth() + 1).padStart(2, '0');
+    const year = String(isoDate.getFullYear()).slice(-2);
+    const hours = String(isoDate.getHours()).padStart(2, '0');
+    const minutes = String(isoDate.getMinutes()).padStart(2, '0');
 
+    return `${day}/${month}/${year} ${hours}:${minutes}`;
+  };
+  let query = async (method = 'find', options = {}, date = null) => {
+    const baseName = pluginOptions.modelName; // "__histories"
     if (options.select !== undefined) {
       Object.assign(options.select, {
         _id: 0,
         collectionId: 0,
-        collectionName: 0
+        collectionName: 0,
       });
-
-      query.select(options.select);
+    }
+    if (date) {
+      const yearMonthSuffix = `_${date.getFullYear()}_${(date.getMonth() + 1)
+        .toString()
+        .padStart(2, '0')}`;
+      const Model = getPartitionedModel(yearMonthSuffix);
+      const query = Model[method](options.find || {});
+      options.select && query.select(options.select);
+      options.sort && query.sort(options.sort);
+      options.populate && query.populate(options.populate);
+      options.limit && query.limit(options.limit);
+      return query.lean();
     }
 
-    options.sort && query.sort(options.sort);
-    options.populate && query.populate(options.populate);
-    options.limit && query.limit(options.limit);
+    // Caso date não seja fornecida → busca em todas coleções particionadas
+    const collections = await mongoose.connection.db
+      .listCollections()
+      .toArray();
+    const historyCollections = collections
+      .map((col) => col.name)
+      .filter((name) => name.startsWith(baseName + '_'));
 
-    return query.lean();
+    const allResults = [];
+
+    for (const name of historyCollections) {
+      try {
+        const Model =
+          mongoose.models[name] || mongoose.model(name, Schema, name);
+        const query = Model[method](options.find || {});
+        options.select && query.select(options.select);
+        options.sort && query.sort(options.sort);
+        options.populate && query.populate(options.populate);
+        options.limit && query.limit(options.limit);
+        const docs = await query.lean();
+        allResults.push(...docs);
+      } catch (err) {
+        console.warn(`Erro ao consultar coleção ${name}:`, err.message);
+      }
+    }
+
+    // Opcional: ordena os resultados globalmente, se houver `sort` e sort form "timestamp"
+    if (options.sort && options.sort === 'timestamp') {
+      const isDesc = options.sort.startsWith('-');
+      allResults.sort((a, b) => {
+        const av = new Date(a['timestamp']);
+        const bv = new Date(b['timestamp']);
+        return isDesc ? bv - av : av - bv;
+      });
+    }
+
+    // Aplica limit global (se necessário)
+    if (options.limit) {
+      return allResults.slice(0, options.limit);
+    }
+
+    return allResults;
   };
 
   let getPreviousVersion = async (document) => {
     // get the oldest version from the history collection
     let versions = await document.getVersions();
-    return versions[versions.length - 1] ?
-      versions[versions.length - 1].object :
-      {};
+    return versions[versions.length - 1]
+      ? versions[versions.length - 1].object
+      : {};
   };
 
   let getPopulatedFields = (document) => {
@@ -154,9 +221,8 @@ let historyPlugin = (options = {}) => {
     }
   };
 
-  let cloneObjectByJson = (object) => object
-    ? JSON.parse(JSON.stringify(object))
-    : {};
+  let cloneObjectByJson = (object) =>
+    object ? JSON.parse(JSON.stringify(object)) : {};
 
   let cleanFields = (object) => {
     delete object.__history;
@@ -184,18 +250,23 @@ let historyPlugin = (options = {}) => {
 
     return {
       diff,
-      saveWithoutDiff
+      saveWithoutDiff,
     };
   };
 
   let saveHistory = async ({ document, diff }) => {
+    const date = new Date(); // Data a partiar da qual será extraída o ano e mês para saber em qual coleção salvar o novo documento .
+    const yearMonthSuffix = `_${date.getFullYear()}_${(date.getMonth() + 1)
+      .toString()
+      .padStart(2, '0')}`;
+    const Model = getPartitionedModel(yearMonthSuffix);
+
     let lastHistory = await Model.findOne({
       collectionName: getModelName(document.constructor.modelName),
-      collectionId: document._id
+      collectionId: document._id,
     })
       .sort('-' + pluginOptions.timestampFieldName)
       .select({ version: 1 });
-
 
     let obj = {};
     obj.collectionName = getModelName(document.constructor.modelName);
@@ -203,18 +274,19 @@ let historyPlugin = (options = {}) => {
     obj.diff = diff || {};
 
     if (document.__history) {
-      obj.event = document.__history.event;
-      obj[pluginOptions.userFieldName] = document.__history[
-        pluginOptions.userFieldName
-      ];
+      (obj.collectionName = getModelName(document.constructor.modelName)),
+        (obj.collectionId = document._id),
+        diff,
+        (obj.event = document.__history.event);
+      obj[pluginOptions.userFieldName] =
+        document.__history[pluginOptions.userFieldName];
       obj[pluginOptions.accountFieldName] =
         document[pluginOptions.accountFieldName] ||
         document.__history[pluginOptions.accountFieldName];
       obj.reason = document.__history.reason;
       obj.data = document.__history.data;
-      obj[pluginOptions.methodFieldName] = document.__history[
-        pluginOptions.methodFieldName
-      ];
+      obj[pluginOptions.methodFieldName] =
+        document.__history[pluginOptions.methodFieldName];
     }
 
     let version;
@@ -243,15 +315,17 @@ let historyPlugin = (options = {}) => {
 
   return function (schema) {
     schema.add({
-      __history: { type: mongoose.Schema.Types.Mixed }
+      __history: { type: mongoose.Schema.Types.Mixed },
     });
 
     let preSave = function (forceSave) {
       return async function (next) {
         let currentDocument = this;
-        if (currentDocument.__history !== undefined || pluginOptions.noEventSave) {
+        if (
+          currentDocument.__history !== undefined ||
+          pluginOptions.noEventSave
+        ) {
           try {
-
             let previousVersion = await getPreviousVersion(currentDocument);
             let populatedFields = getPopulatedFields(currentDocument);
 
@@ -260,7 +334,9 @@ let historyPlugin = (options = {}) => {
             }
 
             let currentObject = cleanFields(cloneObjectByJson(currentDocument));
-            let previousObject = cleanFields(cloneObjectByJson(previousVersion));
+            let previousObject = cleanFields(
+              cloneObjectByJson(previousVersion)
+            );
 
             if (pluginOptions.ignorePopulatedFields) {
               await repopulate(currentDocument, populatedFields);
@@ -270,7 +346,7 @@ let historyPlugin = (options = {}) => {
               current: currentObject,
               prev: previousObject,
               document: currentDocument,
-              forceSave
+              forceSave,
             });
 
             if (diff || pluginOptions.noDiffSave || saveWithoutDiff) {
@@ -292,36 +368,129 @@ let historyPlugin = (options = {}) => {
     schema.pre('remove', preSave(true));
 
     // diff.find
-    schema.methods.getDiffs = function (options = {}) {
-      options.find = options.find || {};
-      Object.assign(options.find, {
-        collectionName: getModelName(this.constructor.modelName),
-        collectionId: this._id
-      });
-
-      options.sort = options.sort || '-' + pluginOptions.timestampFieldName;
-
-      return query('find', options);
-    };
-
-    // diff.get
-    schema.methods.getDiff = function (version, options = {}) {
+    /**
+     * Recupera as diferenças (diffs) de um documento a partir de opções fornecidas.
+     *
+     * @function
+     * @name getDiffs
+     * @param {Object} [options={}] - Opções de busca para os diffs.
+     * @param {Object} [options.find] - Filtros adicionais para a busca.
+     * @param {string} [options.sort] - Campo de ordenação (padrão: timestamp decrescente).
+     * @param {Date} [date] - Data a partiar da qual será extraída o ano e mês para saber em qual coleção será executada a busca.
+     *
+     * @returns {Promise<Array>} Retorna uma Promise que resolve para um array de diffs encontrados.
+     *
+     */
+    schema.methods.getDiffs = function (options = {}, date) {
       options.find = options.find || {};
       Object.assign(options.find, {
         collectionName: getModelName(this.constructor.modelName),
         collectionId: this._id,
-        version: version
+      });
+      options.sort = options.sort || '-' + pluginOptions.timestampFieldName;
+
+      return query('find', options, date);
+    };
+
+    schema.methods.getCompleteSnapshots = async function (
+      versions = [],
+      date,
+      fieldsSelected,
+      desc = true,
+      getDiffId = false
+    ) {
+      const allDiffs = await this.getDiffs(
+        {
+          sort: `${pluginOptions.timestampFieldName}`,
+        },
+        date
+      );
+
+      const semverCompare = (a, b) => {
+        if (semver.gt(a, b)) return 1;
+        if (semver.lt(a, b)) return -1;
+        return 0;
+      };
+
+      const jdf = JsonDiffPatch.create({
+        objectHash: function (obj, index) {
+          return (obj && (obj._id || obj.id || obj.key)) || `$$index:${index}`;
+        },
+        arrays: {
+          detectMove: true,
+        },
+      });
+
+      const result = [];
+      let current = {};
+      let i = 0;
+      const pushedVersions = new Set();
+
+      const sortedTargets = [...versions].sort((a, b) => semverCompare(a, b));
+
+      for (const diffEntry of allDiffs) {
+        const nextTarget = sortedTargets[i];
+        const cmp = semverCompare(diffEntry.version, nextTarget);
+
+        current = jdf.patch(current, diffEntry.diff);
+
+        if (cmp === 0 /* && !pushedVersions.has(diffEntry.version) */) {
+          const filtered = {};
+          fieldsSelected.forEach((field) => {
+            filtered[field] = current[field];
+          });
+          filtered['datahora'] = formatDate(diffEntry.timestamp);
+
+          const isDuplicate =
+            result.length > 0 &&
+            JSON.stringify(result[0]) === JSON.stringify(filtered);
+
+          if (/* true */ !isDuplicate) {
+            if (desc) {
+              result.unshift(JSON.parse(JSON.stringify(filtered)));
+            } else {
+              result.push(JSON.parse(JSON.stringify(filtered)));
+            }
+            pushedVersions.add(diffEntry.version);
+            i++;
+          } else {
+            // se for duplicado, ainda precisamos avançar i (senão trava no mesmo diff)
+            pushedVersions.add(diffEntry.version);
+            i++;
+          }
+        }
+
+        if (i >= sortedTargets.length) break;
+      }
+
+      return result;
+    };
+
+    // diff.get
+    schema.methods.getDiff = function (version, options = {}, date) {
+      const monthSuffix = `_${date.getFullYear()}_${(date.getMonth() + 1)
+        .toString()
+        .padStart(2, '0')}`;
+
+      options.find = options.find || {};
+      Object.assign(options.find, {
+        collectionName: getModelName(this.constructor.modelName) + monthSuffix,
+        collectionId: this._id,
+        version: version,
       });
 
       options.sort = options.sort || '-' + pluginOptions.timestampFieldName;
 
-      return query('findOne', options);
+      return query('findOne', options, date);
     };
 
     // versions.get
-    schema.methods.getVersion = async function (version2get, includeObject = true) {
+    schema.methods.getVersion = async function (
+      version2get,
+      includeObject = true
+    ) {
       let histories = await this.getDiffs({
-        sort: pluginOptions.timestampFieldName
+        sort: pluginOptions.timestampFieldName,
       });
 
       let lastVersion = histories[histories.length - 1],
@@ -360,23 +529,28 @@ let historyPlugin = (options = {}) => {
       history.object = version;
 
       return history;
-
     };
 
     // versions.compare
-    schema.methods.compareVersions = async function (versionLeft, versionRight) {
+    schema.methods.compareVersions = async function (
+      versionLeft,
+      versionRight
+    ) {
       let versionLeftDocument = await this.getVersion(versionLeft);
       let versionRightDocument = await this.getVersion(versionRight);
 
       return {
         diff: jdf.diff(versionLeftDocument.object, versionRightDocument.object),
         left: versionLeftDocument.object,
-        right: versionRightDocument.object
+        right: versionRightDocument.object,
       };
     };
 
     // versions.find
-    schema.methods.getVersions = async function (options = {}, includeObject = true) {
+    schema.methods.getVersions = async function (
+      options = {},
+      includeObject = true
+    ) {
       options.sort = options.sort || pluginOptions.timestampFieldName;
 
       let histories = await this.getDiffs(options);
@@ -393,7 +567,6 @@ let historyPlugin = (options = {}) => {
       }
 
       return histories;
-
     };
   };
 };
