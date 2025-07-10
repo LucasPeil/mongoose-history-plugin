@@ -439,7 +439,9 @@ let historyPlugin = (options = {}) => {
           fieldsSelected.forEach((field) => {
             filtered[field] = current[field];
           });
-          filtered['datahora'] = formatDate(diffEntry.timestamp);
+          filtered['datahora'] = diffEntry.datahora
+            ? formatDate(diffEntry.datahora)
+            : formatDate(diffEntry.timestamp);
 
           const isDuplicate =
             result.length > 0 &&
