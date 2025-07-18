@@ -237,6 +237,9 @@ let historyPlugin = (options = {}) => {
   let getDiff = ({ prev, current, document, forceSave }) => {
     let diff = jdf.diff(prev, current);
 
+    if (diff?.datahora && Array.isArray(diff.datahora)) {
+      diff.datahora = diff.datahora.map((d) => new Date(d));
+    }
     let saveWithoutDiff = false;
     if (document.__history && pluginOptions.noDiffSaveOnMethods.length) {
       let method = document.__history[pluginOptions.methodFieldName];
@@ -397,7 +400,7 @@ let historyPlugin = (options = {}) => {
       date,
       fieldsSelected,
       desc = true,
-      getDiffId = false
+      getIds = false
     ) {
       const allDiffs = await this.getDiffs(
         {
@@ -439,15 +442,20 @@ let historyPlugin = (options = {}) => {
           fieldsSelected.forEach((field) => {
             filtered[field] = current[field];
           });
-          filtered['datahora'] = diffEntry.datahora
-            ? formatDate(diffEntry.datahora)
-            : formatDate(diffEntry.timestamp);
-
+          filtered['datahora'] =
+            /*  diffEntry.datahora ||  */ diffEntry.timestamp;
+          /*  ? formatDate(diffEntry.datahora)
+            : formatDate(diffEntry.timestamp); */
+          /*    console.log( filtered['datahora']) */
+          if (getIds) {
+            filtered['diffId'] = diffEntry._id;
+            filtered['veiculoId'] = diffEntry.collectionId;
+          }
           const isDuplicate =
             result.length > 0 &&
             JSON.stringify(result[0]) === JSON.stringify(filtered);
 
-          if (/* true */ !isDuplicate) {
+          if (!isDuplicate) {
             if (desc) {
               result.unshift(JSON.parse(JSON.stringify(filtered)));
             } else {
